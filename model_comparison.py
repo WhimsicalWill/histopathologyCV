@@ -13,7 +13,7 @@ from sklearn import metrics
 class HistoDataset(Dataset):
     """Histopathology dataset from directory containing image and mask subdirectories."""
 
-    def __init__(self, root_dir, transform=None):
+    def __init__(self, root_dir):
         """
         Args:
             root_dir (string): Directory with all the images.
@@ -21,9 +21,7 @@ class HistoDataset(Dataset):
                 on a sample (defaults to None).
         """
         self.root_dir = root_dir
-        self.transform = transform
         self.filenames1 = [f for f in sorted(os.listdir(root_dir + 'image/')) if isfile(join(root_dir + 'image/', f))]
-        #self.filenames2 = [f for f in (os.listdir(root_dir + 'mask/'))]
 
     def __len__(self):
         return len(self.filenames1)
@@ -35,19 +33,10 @@ class HistoDataset(Dataset):
         gt = plt.imread(mask_path)
         image = np.array(image)
         image = np.array(image) * 255
-        # print(image.max(), image.min())
-        image = image[:, :, :3]
+        image = image[:, :, :3] # remove alpha channel
         gt = (np.array(gt) * 255).astype(int)
-        # print(gt.max(), gt.min())
-
-        if self.transform:
-            image = self.transform(image)
-            gt = self.transform(gt)
-
-        # float tensor image, int tensor gt
         return image, gt, self.filenames1[idx]
 
-# takes in 512 x 512 x 3 float tensors and returns binary tensors
 def convert_mask3d(mask, img):
     """
 		Converts a ground truth image (512, 512) annotated with values 0, 55, and 255
@@ -67,7 +56,6 @@ def convert_mask3d(mask, img):
     target_arr= np.stack((new_mask0, new_mask1, new_mask2), axis=2)
     return target_arr
 
-# mask and gt are the two binary images -- this function calls DiceLoss monai function
 def get_dice_loss(mask, gt):
     """
 		Computes the dice LOSS between a mask and gt tensor using monai
@@ -143,14 +131,14 @@ def evaluate_model(model, case_names, save_path):
                     Using a value higher than 1 may require more memory
 	"""
     device = torch.device('cuda') if torch.cuda.is_available() else torch.device('cpu')
-    max_patches = 8000 #30000
+    max_patches = 6500 #30000
     pixels_per_patch = 2**18
-    # pixel_pred_np = np.empty((pixels_per_patch * max_patches, 1), dtype='float')
-    # pixel_gt_np = np.empty((pixels_per_patch * max_patches, 1), int)
 
-    pixel_pred = torch.empty((pixels_per_patch * max_patches, 1), dtype=torch.float32, device=device)
-    pixel_gt = torch.empty((pixels_per_patch * max_patches, 1), dtype=torch.int32, device=device)
-
+    # device doesn't need to be cuda because monai converts back to nparray
+    pixel_pred = torch.empty((pixels_per_patch * max_patches, 1), dtype=torch.float32)
+    pixel_gt = torch.empty((pixels_per_patch * max_patches, 1), dtype=torch.int32)
+    pixel2_pred = torch.empty((pixels_per_patch * max_patches, 1), dtype=torch.float32)
+    pixel2_gt = torch.empty((pixels_per_patch * max_patches, 1), dtype=torch.int32)
     dice_data = np.empty((max_patches, 3), dtype='float')
     y_pred_np = np.empty((max_patches, 3), int)
     y_np = np.empty((max_patches, 3), int)
@@ -165,14 +153,12 @@ def evaluate_model(model, case_names, save_path):
         for (images, masks, patch_num) in dataloader:
             image, mask = np.squeeze(np.asarray(images)), np.squeeze(np.asarray(masks))
             gt_np = convert_mask3d(mask, image)
-
             normal_gt = gt_np[:, :, 1]
             precancerous_gt = gt_np[:, :, 2]
             if np.sum(precancerous_gt) < pixel_threshold and np.sum(normal_gt) < pixel_threshold:
                 print(f"\n <---- Skipping background patch, {skipped_patches + 1} skipped so far ---->")
                 skipped_patches += 1
                 continue
-
             with torch.no_grad():
                 images = images.to(device)
                 slide_torch = images.permute(0, 3, 1, 2)
@@ -183,16 +169,14 @@ def evaluate_model(model, case_names, save_path):
                 pred = (output > threshold).astype(int)
 
             print(f"\nData for {save_path}, case: {case_name}, patch {patch_num}")
-
             # save patch's pixel values for roc curve
-            precancerous = output[2, :, :]
             ind = curr_patch * pixels_per_patch
-            # if we wanted to compute roc for normal instead of precancerous:
-            # normal = output[1, :, :]
-            # pixel_pred_normal_np[ind:ind + pixels_per_patch] = np.reshape(normal, (pixels_per_patch, 1))
-            # pixel_gt_normal_np[ind:ind + pixels_per_patch] = np.reshape(normal_gt, (pixels_per_patch, 1))
+            precancerous = output[2, :, :]
+            normal = output[1, :, :]
             pixel_pred[ind:ind + pixels_per_patch] = torch.from_numpy(np.reshape(precancerous, (pixels_per_patch, 1)))
             pixel_gt[ind:ind + pixels_per_patch] = torch.from_numpy(np.reshape(precancerous_gt, (pixels_per_patch, 1)))
+            pixel2_pred[ind:ind + pixels_per_patch] = torch.from_numpy(np.reshape(normal, (pixels_per_patch, 1)))
+            pixel2_gt[ind:ind + pixels_per_patch] = torch.from_numpy(np.reshape(normal_gt, (pixels_per_patch, 1)))
 
             # collect data for monai confusion matrix
             y_pred, y = get_binary_predictions(pred, gt_np)
@@ -213,6 +197,8 @@ def evaluate_model(model, case_names, save_path):
     y_np = y_np[:curr_patch, :]
     pixel_pred = pixel_pred[:curr_patch * pixels_per_patch, :]
     pixel_gt = pixel_gt[:curr_patch * pixels_per_patch, :]
+    pixel2_pred = pixel2_pred[:curr_patch * pixels_per_patch, :]
+    pixel2_gt = pixel2_gt[:curr_patch * pixels_per_patch, :]
     print(dice_data.shape, y_pred_np.shape, y_np.shape, pixel_pred.shape, pixel_gt.shape)
     print("Skipped %d black patches" % skipped_patches)
 
@@ -222,10 +208,11 @@ def evaluate_model(model, case_names, save_path):
     print("Computing data metrics...")
     torch.cuda.empty_cache()
     rocauc = np.zeros((3, 1))
-    if torch.sum(pixel_gt) != 0:
-        # Change rocauc index to 1 for normal, 2 for precancerous
-        with torch.no_grad():
-            rocauc[2] = monai.metrics.rocauc.compute_roc_auc(pixel_pred, pixel_gt)
+
+    # This api call will crash if gt does not contain at least 1 positive case
+    with torch.no_grad():
+        rocauc[1] = monai.metrics.rocauc.compute_roc_auc(pixel2_pred, pixel2_gt)
+        rocauc[2] = monai.metrics.rocauc.compute_roc_auc(pixel_pred, pixel_gt)
 
     # compute all metrics and concatenate them into one np.array for easy saving
     meandice = np.expand_dims(np.mean(dice_data, axis=0), axis=1)
@@ -241,14 +228,22 @@ def evaluate_model(model, case_names, save_path):
     C = pd.Index(['MeanDice', 'TP', 'FP', 'TN', 'FN', 'SEN', 'SPEC', 'PREC', 'NPV', 'F1', 'ROC-AUC'], name="cols")
     df = pd.DataFrame(analytics, index=I, columns=C)
     df.to_csv(f'./data/{save_path}/{save_path}_data.csv')
+    print(df)
 
     # create roc curve, save it, then display data & roc curve
     fpr, tpr, thresholds = metrics.roc_curve(pixel_gt.cpu().numpy(), pixel_pred.cpu().numpy())
     roc_auc = metrics.auc(fpr, tpr)
     display = metrics.RocCurveDisplay(fpr=fpr, tpr=tpr, roc_auc=roc_auc, estimator_name=save_path)
     display.plot()
-    plt.savefig(f'./data/{save_path}/{save_path}_roc.png')
-    print(df)
+    plt.savefig(f'./data/{save_path}/{save_path}_roc_precancerous.png')
+    plt.show()
+
+    plt.clf()
+    fpr, tpr, thresholds = metrics.roc_curve(pixel2_gt.cpu().numpy(), pixel2_pred.cpu().numpy())
+    roc_auc = metrics.auc(fpr, tpr)
+    display = metrics.RocCurveDisplay(fpr=fpr, tpr=tpr, roc_auc=roc_auc, estimator_name=save_path)
+    display.plot()
+    plt.savefig(f'./data/{save_path}/{save_path}_roc_normal.png')
     plt.show()
 
 # same as evaluate_model, but collects data for multiple models in one call
